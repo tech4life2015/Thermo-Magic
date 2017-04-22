@@ -1,575 +1,742 @@
+// This library is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+
+// Version 3.7.2 modified on Dec 6, 2011 to support Arduino 1.0
+// See Includes...
+// Modified by Jordan Hochenbaum
+
+// Modified by Tom de Boer @ 26-jun-2014 (Spark Core compatibility)
+
+#include "spark-dallas-temperature.h"
+
+DallasTemperature::DallasTemperature(OneWire* _oneWire)
+#if REQUIRESALARMS
+    : _AlarmHandler(&defaultAlarmHandler)
+#endif
+{
+    _wire = _oneWire;
+    devices = 0;
+    parasite = false;
+    bitResolution = 9;
+    waitForConversion = true;
+    checkForConversion = true;
+}
+
+// initialise the bus
+void DallasTemperature::begin(void)
+{
+    DeviceAddress deviceAddress;
+
+    _wire->reset_search();
+    devices = 0; // Reset the number of devices when we enumerate wire devices
+
+    while (_wire->search(deviceAddress))
+    {
+        if (validAddress(deviceAddress))
+        {
+            if (!parasite && readPowerSupply(deviceAddress)) parasite = true;
+
+            ScratchPad scratchPad;
+
+            readScratchPad(deviceAddress, scratchPad);
+
+            bitResolution = max(bitResolution, getResolution(deviceAddress));
+
+            devices++;
+        }
+    }
+}
+
+// returns the number of devices found on the bus
+uint8_t DallasTemperature::getDeviceCount(void)
+{
+    return devices;
+}
+
+// returns true if address is valid
+bool DallasTemperature::validAddress(const uint8_t* deviceAddress)
+{
+    return (_wire->crc8((uint8_t*)deviceAddress, 7) == deviceAddress[7]);
+}
+
+// finds an address at a given index on the bus
+// returns true if the device was found
+bool DallasTemperature::getAddress(uint8_t* deviceAddress, uint8_t index)
+{
+    uint8_t depth = 0;
+
+    _wire->reset_search();
+
+    while (depth <= index && _wire->search(deviceAddress))
+    {
+        if (depth == index && validAddress(deviceAddress)) return true;
+        depth++;
+    }
+
+    return false;
+}
+
+// attempt to determine if the device at the given address is connected to the bus
+bool DallasTemperature::isConnected(const uint8_t* deviceAddress)
+{
+    ScratchPad scratchPad;
+    return isConnected(deviceAddress, scratchPad);
+}
+
+// attempt to determine if the device at the given address is connected to the bus
+// also allows for updating the read scratchpad
+bool DallasTemperature::isConnected(const uint8_t* deviceAddress, uint8_t* scratchPad)
+{
+    readScratchPad(deviceAddress, scratchPad);
+    return (_wire->crc8(scratchPad, 8) == scratchPad[SCRATCHPAD_CRC]);
+}
+
+// read device's scratch pad
+void DallasTemperature::readScratchPad(const uint8_t* deviceAddress, uint8_t* scratchPad)
+{
+    // send the command
+    _wire->reset();
+    _wire->select(deviceAddress);
+    _wire->write(READSCRATCH);
+
+    // TODO => collect all comments &  use simple loop
+    // byte 0: temperature LSB
+    // byte 1: temperature MSB
+    // byte 2: high alarm temp
+    // byte 3: low alarm temp
+    // byte 4: DS18S20: store for crc
+    //         DS18B20 & DS1822: configuration register
+    // byte 5: internal use & crc
+    // byte 6: DS18S20: COUNT_REMAIN
+    //         DS18B20 & DS1822: store for crc
+    // byte 7: DS18S20: COUNT_PER_C
+    //         DS18B20 & DS1822: store for crc
+    // byte 8: SCRATCHPAD_CRC
+    //
+    // for(int i=0; i<9; i++)
+    // {
+    //   scratchPad[i] = _wire->read();
+    // }
+
+
+    // read the response
+
+    // byte 0: temperature LSB
+    scratchPad[TEMP_LSB] = _wire->read();
+
+    // byte 1: temperature MSB
+    scratchPad[TEMP_MSB] = _wire->read();
+
+    // byte 2: high alarm temp
+    scratchPad[HIGH_ALARM_TEMP] = _wire->read();
+
+    // byte 3: low alarm temp
+    scratchPad[LOW_ALARM_TEMP] = _wire->read();
+
+    // byte 4:
+    // DS18S20: store for crc
+    // DS18B20 & DS1822: configuration register
+    scratchPad[CONFIGURATION] = _wire->read();
+
+    // byte 5:
+    // internal use & crc
+    scratchPad[INTERNAL_BYTE] = _wire->read();
+
+    // byte 6:
+    // DS18S20: COUNT_REMAIN
+    // DS18B20 & DS1822: store for crc
+    scratchPad[COUNT_REMAIN] = _wire->read();
+
+    // byte 7:
+    // DS18S20: COUNT_PER_C
+    // DS18B20 & DS1822: store for crc
+    scratchPad[COUNT_PER_C] = _wire->read();
+
+    // byte 8:
+    // SCTRACHPAD_CRC
+    scratchPad[SCRATCHPAD_CRC] = _wire->read();
+
+    _wire->reset();
+}
+
+// writes device's scratch pad
+void DallasTemperature::writeScratchPad(const uint8_t* deviceAddress, const uint8_t* scratchPad)
+{
+    _wire->reset();
+    _wire->select(deviceAddress);
+    _wire->write(WRITESCRATCH);
+    _wire->write(scratchPad[HIGH_ALARM_TEMP]); // high alarm temp
+    _wire->write(scratchPad[LOW_ALARM_TEMP]); // low alarm temp
+    // DS1820 and DS18S20 have no configuration register
+    if (deviceAddress[0] != DS18S20MODEL) _wire->write(scratchPad[CONFIGURATION]); // configuration
+    _wire->reset();
+    _wire->select(deviceAddress); //<--this line was missing
+    // save the newly written values to eeprom
+    _wire->write(COPYSCRATCH, parasite);
+    if (parasite) delay(10); // 10ms delay
+    _wire->reset();
+}
+
+// reads the device's power requirements
+bool DallasTemperature::readPowerSupply(const uint8_t* deviceAddress)
+{
+    bool ret = false;
+    _wire->reset();
+    _wire->select(deviceAddress);
+    _wire->write(READPOWERSUPPLY);
+    if (_wire->read_bit() == 0) ret = true;
+    _wire->reset();
+    return ret;
+}
+
+
+// set resolution of all devices to 9, 10, 11, or 12 bits
+// if new resolution is out of range, it is constrained.
+void DallasTemperature::setResolution(uint8_t newResolution)
+{
+    bitResolution = constrain(newResolution, 9, 12);
+    DeviceAddress deviceAddress;
+    for (int i=0; i<devices; i++)
+    {
+        getAddress(deviceAddress, i);
+        setResolution(deviceAddress, bitResolution);
+    }
+}
+
+// set resolution of a device to 9, 10, 11, or 12 bits
+// if new resolution is out of range, 9 bits is used.
+bool DallasTemperature::setResolution(const uint8_t* deviceAddress, uint8_t newResolution)
+{
+    ScratchPad scratchPad;
+    if (isConnected(deviceAddress, scratchPad))
+    {
+        // DS1820 and DS18S20 have no resolution configuration register
+        if (deviceAddress[0] != DS18S20MODEL)
+        {
+            switch (newResolution)
+            {
+            case 12:
+                scratchPad[CONFIGURATION] = TEMP_12_BIT;
+                break;
+            case 11:
+                scratchPad[CONFIGURATION] = TEMP_11_BIT;
+                break;
+            case 10:
+                scratchPad[CONFIGURATION] = TEMP_10_BIT;
+                break;
+            case 9:
+            default:
+                scratchPad[CONFIGURATION] = TEMP_9_BIT;
+                break;
+            }
+            writeScratchPad(deviceAddress, scratchPad);
+        }
+        return true;  // new value set
+    }
+    return false;
+}
+
+// returns the global resolution
+uint8_t DallasTemperature::getResolution()
+{
+    return bitResolution;
+}
+
+// returns the current resolution of the device, 9-12
+// returns 0 if device not found
+uint8_t DallasTemperature::getResolution(const uint8_t* deviceAddress)
+{
+    // DS1820 and DS18S20 have no resolution configuration register
+    if (deviceAddress[0] == DS18S20MODEL) return 12;
+
+    ScratchPad scratchPad;
+    if (isConnected(deviceAddress, scratchPad))
+    {
+        switch (scratchPad[CONFIGURATION])
+        {
+        case TEMP_12_BIT:
+            return 12;
+
+        case TEMP_11_BIT:
+            return 11;
+
+        case TEMP_10_BIT:
+            return 10;
+
+        case TEMP_9_BIT:
+            return 9;
+        }
+    }
+    return 0;
+}
+
+
+// sets the value of the waitForConversion flag
+// TRUE : function requestTemperature() etc returns when conversion is ready
+// FALSE: function requestTemperature() etc returns immediately (USE WITH CARE!!)
+//        (1) programmer has to check if the needed delay has passed
+//        (2) but the application can do meaningful things in that time
+void DallasTemperature::setWaitForConversion(bool flag)
+{
+    waitForConversion = flag;
+}
+
+// gets the value of the waitForConversion flag
+bool DallasTemperature::getWaitForConversion()
+{
+    return waitForConversion;
+}
+
+
+// sets the value of the checkForConversion flag
+// TRUE : function requestTemperature() etc will 'listen' to an IC to determine whether a conversion is complete
+// FALSE: function requestTemperature() etc will wait a set time (worst case scenario) for a conversion to complete
+void DallasTemperature::setCheckForConversion(bool flag)
+{
+    checkForConversion = flag;
+}
+
+// gets the value of the waitForConversion flag
+bool DallasTemperature::getCheckForConversion()
+{
+    return checkForConversion;
+}
+
+bool DallasTemperature::isConversionAvailable(const uint8_t* deviceAddress)
+{
+    // Check if the clock has been raised indicating the conversion is complete
+    ScratchPad scratchPad;
+    readScratchPad(deviceAddress, scratchPad);
+    return scratchPad[0];
+}
+
+
+// sends command for all devices on the bus to perform a temperature conversion
+void DallasTemperature::requestTemperatures()
+{
+    _wire->reset();
+    _wire->skip();
+    _wire->write(STARTCONVO, parasite);
+
+    // ASYNC mode?
+    if (!waitForConversion) return;
+    blockTillConversionComplete(bitResolution, NULL);
+}
+
+// sends command for one device to perform a temperature by address
+// returns FALSE if device is disconnected
+// returns TRUE  otherwise
+bool DallasTemperature::requestTemperaturesByAddress(const uint8_t* deviceAddress)
+{
+    _wire->reset();
+    _wire->select(deviceAddress);
+    _wire->write(STARTCONVO, parasite);
+
+    // check device
+    ScratchPad scratchPad;
+    if (!isConnected(deviceAddress, scratchPad)) return false;
+
+    // ASYNC mode?
+    if (!waitForConversion) return true;
+    blockTillConversionComplete(getResolution(deviceAddress), deviceAddress);
+
+    return true;
+}
+
+// returns number of milliseconds to wait till conversion is complete (based on IC datasheet)
+int16_t DallasTemperature::millisToWaitForConversion(uint8_t bitResolution)
+{
+    switch (bitResolution)
+    {
+    case 9:
+        return 94;
+    case 10:
+        return 188;
+    case 11:
+        return 375;
+    default:
+        return 750;
+    }
+}
+
+// Continue to check if the IC has responded with a temperature
+void DallasTemperature::blockTillConversionComplete(uint8_t bitResolution, const uint8_t* deviceAddress)
+{
+    int delms = millisToWaitForConversion(bitResolution);
+    if (deviceAddress != NULL && checkForConversion && !parasite)
+    {
+        unsigned long timend = millis() + delms;
+        while(!isConversionAvailable(deviceAddress) && (millis() < timend));
+    }
+    else
+    {
+        delay(delms);
+    }
+}
+
+// sends command for one device to perform a temp conversion by index
+bool DallasTemperature::requestTemperaturesByIndex(uint8_t deviceIndex)
+{
+    DeviceAddress deviceAddress;
+    getAddress(deviceAddress, deviceIndex);
+    return requestTemperaturesByAddress(deviceAddress);
+}
+
+// Fetch temperature for device index
+float DallasTemperature::getTempCByIndex(uint8_t deviceIndex)
+{
+    DeviceAddress deviceAddress;
+    if (!getAddress(deviceAddress, deviceIndex))
+        return DEVICE_DISCONNECTED_C;
+    return getTempC((uint8_t*)deviceAddress);
+}
+
+// Fetch temperature for device index
+float DallasTemperature::getTempFByIndex(uint8_t deviceIndex)
+{
+    DeviceAddress deviceAddress;
+    if (!getAddress(deviceAddress, deviceIndex))
+        return DEVICE_DISCONNECTED_F;
+    return getTempF((uint8_t*)deviceAddress);
+}
+
+// reads scratchpad and returns fixed-point temperature, scaling factor 2^-7
+int16_t DallasTemperature::calculateTemperature(const uint8_t* deviceAddress, uint8_t* scratchPad)
+{
+    int16_t fpTemperature =
+        (((int16_t) scratchPad[TEMP_MSB]) << 11) |
+        (((int16_t) scratchPad[TEMP_LSB]) << 3);
+
+    /*
+    DS1820 and DS18S20 have a 9-bit temperature register.
+    Resolutions greater than 9-bit can be calculated using the data from
+    the temperature, and COUNT REMAIN and COUNT PER °C registers in the
+    scratchpad.  The resolution of the calculation depends on the model.
+    While the COUNT PER °C register is hard-wired to 16 (10h) in a
+    DS18S20, it changes with temperature in DS1820.
+    After reading the scratchpad, the TEMP_READ value is obtained by
+    truncating the 0.5°C bit (bit 0) from the temperature data. The
+    extended resolution temperature can then be calculated using the
+    following equation:
+                                    COUNT_PER_C - COUNT_REMAIN
+    TEMPERATURE = TEMP_READ - 0.25 + --------------------------
+                                            COUNT_PER_C
+    Hagai Shatz simplified this to integer arithmetic for a 12 bits
+    value for a DS18S20, and James Cameron added legacy DS1820 support.
+    See - http://myarduinotoy.blogspot.co.uk/2013/02/12bit-result-from-ds18s20.html
+    */
+
+    if (deviceAddress[0] == DS18S20MODEL)
+        fpTemperature = ((fpTemperature & 0xfff0) << 3) - 16 +
+            (
+                ((scratchPad[COUNT_PER_C] - scratchPad[COUNT_REMAIN]) << 7) /
+                  scratchPad[COUNT_PER_C]
+            );
+
+    return fpTemperature;
+}
+
+
+// returns temperature in 1/128 degrees C or DEVICE_DISCONNECTED_RAW if the
+// device's scratch pad cannot be read successfully.
+// the numeric value of DEVICE_DISCONNECTED_RAW is defined in
+// DallasTemperature.h. It is a large negative number outside the
+// operating range of the device
+int16_t DallasTemperature::getTemp(const uint8_t* deviceAddress)
+{
+    ScratchPad scratchPad;
+    if (isConnected(deviceAddress, scratchPad)) return calculateTemperature(deviceAddress, scratchPad);
+    return DEVICE_DISCONNECTED_RAW;
+}
+
+// returns temperature in degrees C or DEVICE_DISCONNECTED_C if the
+// device's scratch pad cannot be read successfully.
+// the numeric value of DEVICE_DISCONNECTED_C is defined in
+// DallasTemperature.h. It is a large negative number outside the
+// operating range of the device
+float DallasTemperature::getTempC(const uint8_t* deviceAddress)
+{
+    return rawToCelsius(getTemp(deviceAddress));
+}
+
+// returns temperature in degrees F or DEVICE_DISCONNECTED_F if the
+// device's scratch pad cannot be read successfully.
+// the numeric value of DEVICE_DISCONNECTED_F is defined in
+// DallasTemperature.h. It is a large negative number outside the
+// operating range of the device
+float DallasTemperature::getTempF(const uint8_t* deviceAddress)
+{
+    return rawToFahrenheit(getTemp(deviceAddress));
+}
+
+// returns true if the bus requires parasite power
+bool DallasTemperature::isParasitePowerMode(void)
+{
+    return parasite;
+}
+
+#if REQUIRESALARMS
+
 /*
-
-Particle Verison of OneWire Libary
-
-Hotaman 2/1/2016
-Bit and Byte write functions have been changed to only drive the bus high at the end of a byte when requested.
-They no longer drive the bus for High bits when outputting to avoid a holy war.
-Some folks just can't accept that a 10K resistor works just fine when the calculation calls for 10,042.769 ohms.
-Bit and Byte writes are now 100% compliant with specs and app notes.
-
-Support for P1 and Electron added by Hotaman 11/30/2015
-
-Support for Photon added by Brendan Albano and cdrodriguez
-- Brendan Albano 2015-06-10
-
-I made monor tweeks to allow use in the web builder and created this repository for
-use in the contributed libs list.
-
-6/2014 - Hotaman 
-
-I've taken the code that Spark Forum user tidwelltimj posted 
-split it back into separte code and header files and put back in the 
-credits and comments and got it compiling on the command line within SparkCore core-firmware
-
-
-Justin Maynard 2013
-
-Original Comments follow
-
-Copyright (c) 2007, Jim Studt  (original old version - many contributors since)
-
-The latest version of this library may be found at:
-  http://www.pjrc.com/teensy/td_libs_OneWire.html
-
-OneWire has been maintained by Paul Stoffregen (paul@pjrc.com) since
-January 2010.  At the time, it was in need of many bug fixes, but had
-been abandoned the original author (Jim Studt).  None of the known
-contributors were interested in maintaining OneWire.  Paul typically
-works on OneWire every 6 to 12 months.  Patches usually wait that
-long.  If anyone is interested in more actively maintaining OneWire,
-please contact Paul.
-
-Version 2.2:
-  Teensy 3.0 compatibility, Paul Stoffregen, paul@pjrc.com
-  Arduino Due compatibility, http://arduino.cc/forum/index.php?topic=141030
-  Fix DS18B20 example negative temperature
-  Fix DS18B20 example's low res modes, Ken Butcher
-  Improve reset timing, Mark Tillotson
-  Add const qualifiers, Bertrik Sikken
-  Add initial value input to crc16, Bertrik Sikken
-  Add target_search() function, Scott Roberts
-
-Version 2.1:
-  Arduino 1.0 compatibility, Paul Stoffregen
-  Improve temperature example, Paul Stoffregen
-  DS250x_PROM example, Guillermo Lovato
-  PIC32 (chipKit) compatibility, Jason Dangel, dangel.jason AT gmail.com
-  Improvements from Glenn Trewitt:
-  - crc16() now works
-  - check_crc16() does all of calculation/checking work.
-  - Added read_bytes() and write_bytes(), to reduce tedious loops.
-  - Added ds2408 example.
-  Delete very old, out-of-date readme file (info is here)
-
-Version 2.0: Modifications by Paul Stoffregen, January 2010:
-http://www.pjrc.com/teensy/td_libs_OneWire.html
-  Search fix from Robin James
-    http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1238032295/27#27
-  Use direct optimized I/O in all cases
-  Disable interrupts during timing critical sections
-    (this solves many random communication errors)
-  Disable interrupts during read-modify-write I/O
-  Reduce RAM consumption by eliminating unnecessary
-    variables and trimming many to 8 bits
-  Optimize both crc8 - table version moved to flash
-
-Modified to work with larger numbers of devices - avoids loop.
-Tested in Arduino 11 alpha with 12 sensors.
-26 Sept 2008 -- Robin James
-http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1238032295/27#27
-
-Updated to work with arduino-0008 and to include skip() as of
-2007/07/06. --RJL20
-
-Modified to calculate the 8-bit CRC directly, avoiding the need for
-the 256-byte lookup table to be loaded in RAM.  Tested in arduino-0010
--- Tom Pollard, Jan 23, 2008
-
-Jim Studt's original library was modified by Josh Larios.
-
-Tom Pollard, pollard@alum.mit.edu, contributed around May 20, 2008
-
-Permission is hereby granted, free of charge, to any person obtaining
-a copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
-
-The above copyright notice and this permission notice shall be
-included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
-LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-Much of the code was inspired by Derek Yerger's code, though I don't
-think much of that remains.  In any event that was..
-    (copyleft) 2006 by Derek Yerger - Free to distribute freely.
-
-The CRC code was excerpted and inspired by the Dallas Semiconductor
-sample code bearing this copyright.
-//---------------------------------------------------------------------------
-// Copyright (C) 2000 Dallas Semiconductor Corporation, All Rights Reserved.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a
-// copy of this software and associated documentation files (the "Software"),
-// to deal in the Software without restriction, including without limitation
-// the rights to use, copy, modify, merge, publish, distribute, sublicense,
-// and/or sell copies of the Software, and to permit persons to whom the
-// Software is furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included
-// in all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-// MERCHANTABILITY,  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-// IN NO EVENT SHALL DALLAS SEMICONDUCTOR BE LIABLE FOR ANY CLAIM, DAMAGES
-// OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-// ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-// OTHER DEALINGS IN THE SOFTWARE.
-//
-// Except as contained in this notice, the name of Dallas Semiconductor
-// shall not be used except as stated in the Dallas Semiconductor
-// Branding Policy.
-//--------------------------------------------------------------------------
+ALARMS:
+TH and TL Register Format
+BIT 7 BIT 6 BIT 5 BIT 4 BIT 3 BIT 2 BIT 1 BIT 0
+  S    2^6   2^5   2^4   2^3   2^2   2^1   2^0
+Only bits 11 through 4 of the temperature register are used
+in the TH and TL comparison since TH and TL are 8-bit
+registers. If the measured temperature is lower than or equal
+to TL or higher than or equal to TH, an alarm condition exists
+and an alarm flag is set inside the DS18B20. This flag is
+updated after every temperature measurement; therefore, if the
+alarm condition goes away, the flag will be turned off after
+the next temperature conversion.
 */
 
-#include "OneWire.h"
-#include "application.h"
-
-OneWire::OneWire(uint16_t pin)
+// sets the high alarm temperature for a device in degrees Celsius
+// accepts a float, but the alarm resolution will ignore anything
+// after a decimal point.  valid range is -55C - 125C
+void DallasTemperature::setHighAlarmTemp(const uint8_t* deviceAddress, char celsius)
 {
-    pinMode(pin, INPUT);
-    _pin = pin;
-}
-// Perform the onewire reset function.  We will wait up to 250uS for
-// the bus to come high, if it doesn't then it is broken or shorted
-// and we return a 0;
-//
-// Returns 1 if a device asserted a presence pulse, 0 otherwise.
-//
-uint8_t OneWire::reset(void)
-{
-    uint8_t r;
-    uint8_t retries = 125;
+    // make sure the alarm temperature is within the device's range
+    if (celsius > 125) celsius = 125;
+    else if (celsius < -55) celsius = -55;
 
-    noInterrupts();
-    pinModeFastInput();
-    interrupts();
-    // wait until the wire is high... just in case
-    do {
-        if (--retries == 0) return 0;
-
-        delayMicroseconds(2);
-    } while ( !digitalReadFast());
-
-    noInterrupts();
-
-    digitalWriteFastLow();
-    pinModeFastOutput();   // drive output low
-
-    interrupts();
-    delayMicroseconds(480);
-    noInterrupts();
-
-    pinModeFastInput();    // allow it to float
-
-    delayMicroseconds(70);
-
-    r =! digitalReadFast();
-
-    interrupts();
-
-    delayMicroseconds(410);
-
-    return r;
-}
-
-void OneWire::write_bit(uint8_t v)
-{
-    if (v & 1) {
-        noInterrupts();
-
-        digitalWriteFastLow();
-        pinModeFastOutput();   // drive output low
-
-        delayMicroseconds(10);
-
-        pinModeFastInput();    // float high
-
-        interrupts();
-
-        delayMicroseconds(55);
-    } else {
-        noInterrupts();
-
-        digitalWriteFastLow();
-        pinModeFastOutput();   // drive output low
-
-        delayMicroseconds(65);
-
-        pinModeFastInput();    // float high
-
-        interrupts();
-
-        delayMicroseconds(5);
+    ScratchPad scratchPad;
+    if (isConnected(deviceAddress, scratchPad))
+    {
+        scratchPad[HIGH_ALARM_TEMP] = (uint8_t)celsius;
+        writeScratchPad(deviceAddress, scratchPad);
     }
 }
 
-//
-// Read a bit. Port and bit is used to cut lookup time and provide
-// more certain timing.
-//
-uint8_t OneWire::read_bit(void)
+// sets the low alarm temperature for a device in degrees Celsius
+// accepts a float, but the alarm resolution will ignore anything
+// after a decimal point.  valid range is -55C - 125C
+void DallasTemperature::setLowAlarmTemp(const uint8_t* deviceAddress, char celsius)
 {
-    uint8_t r;
+    // make sure the alarm temperature is within the device's range
+    if (celsius > 125) celsius = 125;
+    else if (celsius < -55) celsius = -55;
 
-    noInterrupts();
-
-    digitalWriteFastLow();
-    pinModeFastOutput();
-
-    delayMicroseconds(3);
-
-    pinModeFastInput();    // let pin float, pull up will raise
-
-    delayMicroseconds(10);
-
-    r = digitalReadFast();
-
-    interrupts();
-    delayMicroseconds(53);
-
-    return r;
-}
-
-//
-// Write a byte. The writing code uses the active drivers to raise the
-// pin high, if you need power after the write (e.g. DS18S20 in
-// parasite power mode) then set 'power' to 1, otherwise the pin will
-// go tri-state at the end of the write to avoid heating in a short or
-// other mishap.
-//
-void OneWire::write(uint8_t v, uint8_t power /* = 0 */) 
-{
-    uint8_t bitMask;
-
-    for (bitMask = 0x01; bitMask; bitMask <<= 1) {
-        OneWire::write_bit( (bitMask & v)?1:0);
-    }
-
-    if ( power) {
-        noInterrupts();
-
-        digitalWriteFastHigh();
-        pinModeFastOutput();        // Drive pin High when power is True
-
-        interrupts();
+    ScratchPad scratchPad;
+    if (isConnected(deviceAddress, scratchPad))
+    {
+        scratchPad[LOW_ALARM_TEMP] = (uint8_t)celsius;
+        writeScratchPad(deviceAddress, scratchPad);
     }
 }
 
-void OneWire::write_bytes(const uint8_t *buf, uint16_t count, bool power /* = 0 */) 
+// returns a char with the current high alarm temperature or
+// DEVICE_DISCONNECTED for an address
+char DallasTemperature::getHighAlarmTemp(const uint8_t* deviceAddress)
 {
-    for (uint16_t i = 0 ; i < count ; i++)
-        write(buf[i]);
-
-    if (power) {
-        noInterrupts();
-
-        digitalWriteFastHigh();
-        pinModeFastOutput();        // Drive pin High when power is True
-
-        interrupts();
-    }
+    ScratchPad scratchPad;
+    if (isConnected(deviceAddress, scratchPad)) return (char)scratchPad[HIGH_ALARM_TEMP];
+    return DEVICE_DISCONNECTED_C;
 }
 
-//
-// Read a byte
-//
-uint8_t OneWire::read() 
+// returns a char with the current low alarm temperature or
+// DEVICE_DISCONNECTED for an address
+char DallasTemperature::getLowAlarmTemp(const uint8_t* deviceAddress)
 {
-    uint8_t bitMask;
-    uint8_t r = 0;
-
-    for (bitMask = 0x01; bitMask; bitMask <<= 1) {
-        if ( OneWire::read_bit()) r |= bitMask;
-    }
-
-    return r;
+    ScratchPad scratchPad;
+    if (isConnected(deviceAddress, scratchPad)) return (char)scratchPad[LOW_ALARM_TEMP];
+    return DEVICE_DISCONNECTED_C;
 }
 
-void OneWire::read_bytes(uint8_t *buf, uint16_t count) 
+// resets internal variables used for the alarm search
+void DallasTemperature::resetAlarmSearch()
 {
-    for (uint16_t i = 0 ; i < count ; i++)
-        buf[i] = read();
+    alarmSearchJunction = -1;
+    alarmSearchExhausted = 0;
+    for(uint8_t i = 0; i < 7; i++)
+        alarmSearchAddress[i] = 0;
 }
 
+// This is a modified version of the OneWire::search method.
 //
-// Do a ROM select
+// Also added the OneWire search fix documented here:
+// http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1238032295
 //
-void OneWire::select(const uint8_t rom[8])
-{
-    uint8_t i;
-
-    write(0x55);           // Choose ROM
-
-    for (i = 0; i < 8; i++) write(rom[i]);
-}
-
-//
-// Do a ROM skip
-//
-void OneWire::skip()
-{
-    write(0xCC);           // Skip ROM
-}
-
-void OneWire::depower()
-{
-    noInterrupts();
-
-    pinModeFastInput();
-
-    interrupts();
-}
-
-#if ONEWIRE_SEARCH
-
-//
-// You need to use this function to start a search again from the beginning.
-// You do not need to do it for the first search, though you could.
-//
-void OneWire::reset_search()
-{
-    // reset the search state
-    LastDiscrepancy = 0;
-    LastDeviceFlag = FALSE;
-    LastFamilyDiscrepancy = 0;
-
-    for(int i = 7; ; i--) {
-        ROM_NO[i] = 0;
-        if ( i == 0) break;
-    }
-}
-
-// Setup the search to find the device type 'family_code' on the next call
-// to search(*newAddr) if it is present.
-//
-void OneWire::target_search(uint8_t family_code)
-{
-   // set the search state to find SearchFamily type devices
-
-   ROM_NO[0] = family_code;
-
-   for (uint8_t i = 1; i < 8; i++)
-      ROM_NO[i] = 0;
-
-   LastDiscrepancy = 64;
-   LastFamilyDiscrepancy = 0;
-   LastDeviceFlag = FALSE;
-}
-
-//
-// Perform a search. If this function returns a '1' then it has
+// Perform an alarm search. If this function returns a '1' then it has
 // enumerated the next device and you may retrieve the ROM from the
 // OneWire::address variable. If there are no devices, no further
 // devices, or something horrible happens in the middle of the
 // enumeration then a 0 is returned.  If a new device is found then
-// its address is copied to newAddr.  Use OneWire::reset_search() to
-// start over.
-//
-// --- Replaced by the one from the Dallas Semiconductor web site ---
-//--------------------------------------------------------------------------
-// Perform the 1-Wire Search Algorithm on the 1-Wire bus using the existing
-// search state.
-// Return TRUE  : device found, ROM number in ROM_NO buffer
-//        FALSE : device not found, end of search
-//
-uint8_t OneWire::search(uint8_t *newAddr)
+// its address is copied to newAddr.  Use
+// DallasTemperature::resetAlarmSearch() to start over.
+bool DallasTemperature::alarmSearch(uint8_t* newAddr)
 {
-    uint8_t id_bit_number;
-    uint8_t last_zero, rom_byte_number, search_result;
-    uint8_t id_bit, cmp_id_bit;
+    uint8_t i;
+    char lastJunction = -1;
+    uint8_t done = 1;
 
-    unsigned char rom_byte_mask, search_direction;
+    if (alarmSearchExhausted) return false;
+    if (!_wire->reset()) return false;
 
-    // initialize for search
-    id_bit_number = 1;
-    last_zero = 0;
-    rom_byte_number = 0;
-    rom_byte_mask = 1;
-    search_result = 0;
+    // send the alarm search command
+    _wire->write(0xEC, 0);
 
-    // if the last call was not the last one
-    if (!LastDeviceFlag)
+    for(i = 0; i < 64; i++)
     {
-        // 1-Wire reset
-        if (!reset()){
-            // reset the search
-            LastDiscrepancy = 0;
-            LastDeviceFlag = FALSE;
-            LastFamilyDiscrepancy = 0;
+        uint8_t a = _wire->read_bit( );
+        uint8_t nota = _wire->read_bit( );
+        uint8_t ibyte = i / 8;
+        uint8_t ibit = 1 << (i & 7);
 
-            return FALSE;
-        }
+        // I don't think this should happen, this means nothing responded, but maybe if
+        // something vanishes during the search it will come up.
+        if (a && nota) return false;
 
-        // issue the search command
-        write(0xF0);
-
-        // loop to do the search
-        do
+        if (!a && !nota)
         {
-            // read a bit and its complement
-            id_bit = read_bit();
-            cmp_id_bit = read_bit();
-
-            // check for no devices on 1-wire
-            if ((id_bit == 1) && (cmp_id_bit == 1)){
-                break;
+            if (i == alarmSearchJunction)
+            {
+                // this is our time to decide differently, we went zero last time, go one.
+                a = 1;
+                alarmSearchJunction = lastJunction;
+            }
+            else if (i < alarmSearchJunction)
+            {
+                // take whatever we took last time, look in address
+                if (alarmSearchAddress[ibyte] & ibit) a = 1;
+                else
+                {
+                    // Only 0s count as pending junctions, we've already exhausted the 0 side of 1s
+                    a = 0;
+                    done = 0;
+                    lastJunction = i;
+                }
             }
             else
             {
-                // all devices coupled have 0 or 1
-                if (id_bit != cmp_id_bit){
-                    search_direction = id_bit;  // bit write value for search
-                }
-                else{
-                    // if this discrepancy if before the Last Discrepancy
-                    // on a previous next then pick the same as last time
-                    if (id_bit_number < LastDiscrepancy)
-                        search_direction = ((ROM_NO[rom_byte_number] & rom_byte_mask) > 0);
-                    else
-                        // if equal to last pick 1, if not then pick 0
-                        search_direction = (id_bit_number == LastDiscrepancy);
-
-                    // if 0 was picked then record its position in LastZero
-                    if (search_direction == 0){
-                        last_zero = id_bit_number;
-
-                        // check for Last discrepancy in family
-                        if (last_zero < 9)
-                            LastFamilyDiscrepancy = last_zero;
-                    }
-                }
-
-                // set or clear the bit in the ROM byte rom_byte_number
-                // with mask rom_byte_mask
-                if (search_direction == 1)
-                  ROM_NO[rom_byte_number] |= rom_byte_mask;
-                else
-                  ROM_NO[rom_byte_number] &= ~rom_byte_mask;
-
-                // serial number search direction write bit
-                write_bit(search_direction);
-
-                // increment the byte counter id_bit_number
-                // and shift the mask rom_byte_mask
-                id_bit_number++;
-                rom_byte_mask <<= 1;
-
-                // if the mask is 0 then go to new SerialNum byte rom_byte_number and reset mask
-                if (rom_byte_mask == 0)
-                {
-                    rom_byte_number++;
-                    rom_byte_mask = 1;
-                }
+                // we are blazing new tree, take the 0
+                a = 0;
+                alarmSearchJunction = i;
+                done = 0;
             }
-        }while(rom_byte_number < 8);  // loop until through all ROM bytes 0-7
-
-        // if the search was successful then
-        if (!(id_bit_number < 65))
-        {
-            // search successful so set LastDiscrepancy,LastDeviceFlag,search_result
-            LastDiscrepancy = last_zero;
-
-            // check for last device
-            if (LastDiscrepancy == 0)
-                LastDeviceFlag = TRUE;
-
-            search_result = TRUE;
+            // OneWire search fix
+            // See: http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1238032295
         }
+
+        if (a) alarmSearchAddress[ibyte] |= ibit;
+        else alarmSearchAddress[ibyte] &= ~ibit;
+
+        _wire->write_bit(a);
     }
 
-    // if no device found then reset counters so next 'search' will be like a first
-    if (!search_result || !ROM_NO[0]){
-        LastDiscrepancy = 0;
-        LastDeviceFlag = FALSE;
-        LastFamilyDiscrepancy = 0;
-        search_result = FALSE;
+    if (done) alarmSearchExhausted = 1;
+    for (i = 0; i < 8; i++) newAddr[i] = alarmSearchAddress[i];
+    return true;
+}
+
+// returns true if device address might have an alarm condition
+// (only an alarm search can verify this)
+bool DallasTemperature::hasAlarm(const uint8_t* deviceAddress)
+{
+    ScratchPad scratchPad;
+    if (isConnected(deviceAddress, scratchPad))
+    {
+        char temp = calculateTemperature(deviceAddress, scratchPad) >> 7;
+
+        // check low alarm
+        if (temp <= (char)scratchPad[LOW_ALARM_TEMP]) return true;
+
+        // check high alarm
+        if (temp >= (char)scratchPad[HIGH_ALARM_TEMP]) return true;
     }
 
-    for (int i = 0; i < 8; i++) newAddr[i] = ROM_NO[i];
+    // no alarm
+    return false;
+}
 
-    return search_result;
+// returns true if any device is reporting an alarm condition on the bus
+bool DallasTemperature::hasAlarm(void)
+{
+    DeviceAddress deviceAddress;
+    resetAlarmSearch();
+    return alarmSearch(deviceAddress);
+}
+
+// runs the alarm handler for all devices returned by alarmSearch()
+void DallasTemperature::processAlarms(void)
+{
+    resetAlarmSearch();
+    DeviceAddress alarmAddr;
+
+    while (alarmSearch(alarmAddr))
+    {
+        if (validAddress(alarmAddr))
+            _AlarmHandler(alarmAddr);
+    }
+}
+
+// sets the alarm handler
+void DallasTemperature::setAlarmHandler(AlarmHandler *handler)
+{
+    _AlarmHandler = handler;
+}
+
+// The default alarm handler
+void DallasTemperature::defaultAlarmHandler(const uint8_t* deviceAddress)
+{
 }
 
 #endif
 
-#if ONEWIRE_CRC
-// The 1-Wire CRC scheme is described in Maxim Application Note 27:
-// "Understanding and Using Cyclic Redundancy Checks with Maxim iButton Products"
-//
-
-
-//
-// Compute a Dallas Semiconductor 8 bit CRC directly.
-// this is much slower, but much smaller, than the lookup table.
-//
-uint8_t OneWire::crc8( uint8_t *addr, uint8_t len)
+// Convert float Celsius to Fahrenheit
+float DallasTemperature::toFahrenheit(float celsius)
 {
-    uint8_t crc = 0;
-
-    while (len--) {
-        uint8_t inbyte = *addr++;
-        for (uint8_t i = 8; i; i--) {
-            uint8_t mix = (crc ^ inbyte) & 0x01;
-            crc >>= 1;
-            if (mix) crc ^= 0x8C;
-                inbyte >>= 1;
-        }
-    }
-
-    return crc;
-}
-#endif
-
-#if ONEWIRE_CRC16
-bool OneWire::check_crc16(const uint8_t* input, uint16_t len, const uint8_t* inverted_crc, uint16_t crc)
-{
-    crc = ~crc16(input, len, crc);
-
-    return (crc & 0xFF) == inverted_crc[0] && (crc >> 8) == inverted_crc[1];
+    return (celsius * 1.8) + 32;
 }
 
-uint16_t OneWire::crc16(const uint8_t* input, uint16_t len, uint16_t crc)
+// Convert float Fahrenheit to Celsius
+float DallasTemperature::toCelsius(float fahrenheit)
 {
-    static const uint8_t oddparity[16] =
-        { 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0 };
-
-    for (uint16_t i = 0 ; i < len ; i++) {
-        // Even though we're just copying a byte from the input,
-        // we'll be doing 16-bit computation with it.
-        uint16_t cdata = input[i];
-        cdata = (cdata ^ crc) & 0xff;
-        crc >>= 8;
-
-        if (oddparity[cdata & 0x0F] ^ oddparity[cdata >> 4])
-            crc ^= 0xC001;
-
-        cdata <<= 6;
-        crc ^= cdata;
-        cdata <<= 1;
-        crc ^= cdata;
-    }
-
-    return crc;
+    return (fahrenheit - 32) * 0.555555556;
 }
+
+// convert from raw to Celsius
+float DallasTemperature::rawToCelsius(int16_t raw)
+{
+    if (raw <= DEVICE_DISCONNECTED_RAW)
+        return DEVICE_DISCONNECTED_C;
+    // C = RAW/128
+    return (float)raw * 0.0078125;
+}
+
+// convert from raw to Fahrenheit
+float DallasTemperature::rawToFahrenheit(int16_t raw)
+{
+    if (raw <= DEVICE_DISCONNECTED_RAW)
+        return DEVICE_DISCONNECTED_F;
+    // C = RAW/128
+    // F = (C*1.8)+32 = (RAW/128*1.8)+32 = (RAW*0.0140625)+32
+    return ((float)raw * 0.0140625) + 32;
+}
+
+#if REQUIRESNEW
+
+// MnetCS - Allocates memory for DallasTemperature. Allows us to instance a new object
+void* DallasTemperature::operator new(unsigned int size) // Implicit NSS obj size
+{
+    void * p; // void pointer
+    p = malloc(size); // Allocate memory
+    memset((DallasTemperature*)p,0,size); // Initialise memory
+
+    //!!! CANT EXPLICITLY CALL CONSTRUCTOR - workaround by using an init() methodR - workaround by using an init() method
+    return (DallasTemperature*) p; // Cast blank region to NSS pointer
+}
+
+// MnetCS 2009 -  Free the memory used by this instance
+void DallasTemperature::operator delete(void* p)
+{
+    DallasTemperature* pNss =  (DallasTemperature*) p; // Cast to NSS pointer
+    pNss->~DallasTemperature(); // Destruct the object
+
+    free(p); // Free the memory
+}
+
 #endif
